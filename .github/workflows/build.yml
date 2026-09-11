@@ -1,0 +1,124 @@
+name: Build and Push
+
+on:
+  push:
+    branches: [main]
+    paths: ['docker/**', 'VERSION', 'TRUST']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write # cosign needs an OIDC token to talk to Rekor
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Read VERSION
+        id: version
+        run: |
+          set -euo pipefail
+          echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # THE trust boundary of this repo.
+      #
+      # Zebra ships no PGP signature, so there is no key to allowlist. Instead
+      # upstream's SHA256SUMS is signed via Sigstore, and the signature is only
+      # meaningful if we pin WHO signed it: the exact workflow file, in the exact
+      # repo, at the exact tag. That identity template lives in ./TRUST.
+      #
+      # cosign verify-blob fails closed on identity mismatch, so a SHA256SUMS
+      # signed by any other workflow -- or for any other release -- is rejected
+      # here rather than becoming a build-arg.
+      - name: Verify upstream SHA256SUMS via Sigstore
+        id: verify
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/ZcashFoundation/zebra/releases/download/v${VERSION}"
+          curl -sSLfo SHA256SUMS               "${BASE}/SHA256SUMS"
+          curl -sSLfo SHA256SUMS.sigstore.json "${BASE}/SHA256SUMS.sigstore.json"
+
+          ISSUER=$(sed -n 's/^oidc_issuer=//p' TRUST)
+          IDENTITY=$(sed -n 's/^identity=//p' TRUST | sed "s/\${VERSION}/${VERSION}/g")
+          echo "pinned issuer:   ${ISSUER}"
+          echo "pinned identity: ${IDENTITY}"
+          [ -n "${ISSUER}" ] && [ -n "${IDENTITY}" ] || { echo "ERROR: TRUST did not yield an issuer/identity"; exit 1; }
+
+          cosign verify-blob SHA256SUMS \
+            --bundle SHA256SUMS.sigstore.json \
+            --certificate-oidc-issuer "${ISSUER}" \
+            --certificate-identity    "${IDENTITY}"
+
+          # Pull the per-platform digests out of the now-trusted SHA256SUMS.
+          # Herestrings, never `... | grep ...` under pipefail -- see the note in
+          # docker/docker-entrypoint.sh.
+          AMD64=$(awk -v f="zebrad-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"  '$2==f {print $1}' SHA256SUMS)
+          ARM64=$(awk -v f="zebrad-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" '$2==f {print $1}' SHA256SUMS)
+          for v in "$AMD64" "$ARM64"; do
+            case "$v" in
+              [0-9a-f]*) [ ${#v} -eq 64 ] || { echo "ERROR: malformed digest '$v'"; exit 1; } ;;
+              *) echo "ERROR: missing digest for v${VERSION} in signed SHA256SUMS"; exit 1 ;;
+            esac
+          done
+          echo "amd64=$AMD64" >> "$GITHUB_OUTPUT"
+          echo "arm64=$ARM64" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Sigstore verification — **passed**"
+            echo ""
+            echo "\`SHA256SUMS\` for \`v${VERSION}\` verified against:"
+            echo ""
+            echo "- issuer \`${ISSUER}\`"
+            echo "- identity \`${IDENTITY}\`"
+            echo ""
+            echo "| platform | sha256 |"
+            echo "|---|---|"
+            echo "| linux/amd64 | \`${AMD64}\` |"
+            echo "| linux/arm64 | \`${ARM64}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            ZEBRAD_SHA256_AMD64=${{ steps.verify.outputs.amd64 }}
+            ZEBRAD_SHA256_ARM64=${{ steps.verify.outputs.arm64 }}
+          tags: |
+            ghcr.io/kub0-ai/zebra:${{ steps.version.outputs.version }}
+            ghcr.io/kub0-ai/zebra:latest
+          cache-from: type=registry,ref=ghcr.io/kub0-ai/zebra:buildcache
+          cache-to: type=registry,ref=ghcr.io/kub0-ai/zebra:buildcache,mode=max
+
+      - name: Create git tag
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Zebra ${{ steps.version.outputs.version }}" || true
+          git push origin "v${{ steps.version.outputs.version }}" || true

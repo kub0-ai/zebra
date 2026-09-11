@@ -1,0 +1,28 @@
+# Sigstore trust root for ZcashFoundation/zebra release binaries.
+#
+# Zebra does NOT sign releases with PGP. There is no long-lived key and no
+# keyserver, so the KEYS-allowlist pattern used by the bitcoin-core / monero /
+# dogecoin-core packaging repos does not apply here. Releases carry
+# SHA256SUMS.sigstore.json: a Sigstore bundle whose trust anchor is a short-lived
+# Fulcio certificate bound to the exact GitHub Actions workflow that built them,
+# countersigned into the Rekor transparency log.
+#
+# What is pinned below is therefore an IDENTITY, not a key:
+#
+#   issuer   the OIDC provider that attested the build (GitHub Actions)
+#   identity the exact workflow file, in the exact repo, at the exact tag
+#
+# ${VERSION} is substituted at verification time, so the identity is pinned to
+# the precise tag being built. Do NOT relax this to a regexp over tags: an exact
+# match is what makes a signature for some other release unusable here.
+#
+# Verified against v6.3.0 on 2026-09-11 by decoding the bundle's certificate:
+#   SAN  URI:https://github.com/ZcashFoundation/zebra/.github/workflows/zfnd-release-binaries.yml@refs/tags/v6.3.0
+#   OIDC 1.3.6.1.4.1.57264.1.1 = https://token.actions.githubusercontent.com
+#   src  1.3.6.1.4.1.57264.1.12 = https://github.com/ZcashFoundation/zebra
+#   sha  1.3.6.1.4.1.57264.1.13 = f5c5277fe41eba9c74f37098738f93f35dd70d60
+# That commit matches upstream's own zfnd/zebra:sha-f5c5277 image tag, so the
+# signed binaries and the official image come from one commit.
+
+oidc_issuer=https://token.actions.githubusercontent.com
+identity=https://github.com/ZcashFoundation/zebra/.github/workflows/zfnd-release-binaries.yml@refs/tags/v${VERSION}

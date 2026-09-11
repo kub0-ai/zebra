@@ -1,0 +1,250 @@
+name: Watch Upstream Release
+
+# Two-stage release automation with a TRUST-CONDITIONAL human gate.
+#
+#   detect upstream -> preflight the build's own Sigstore check -> decide:
+#     PASS : auto-merge the release PR, then dispatch build.yml. Hands-off.
+#            The pinned identity in ./TRUST already covers this release, so a
+#            human clicking "merge" adds no security -- only latency.
+#     FAIL : open/keep the PR, DO NOT merge, exit 1 (red). Upstream's release
+#            signing identity changed, and that IS worth a person's attention.
+#
+# Why an explicit workflow_dispatch instead of relying on build.yml's push
+# trigger: events raised by the default GITHUB_TOKEN do not create new workflow
+# runs (GitHub's anti-recursion rule), so an auto-merged VERSION bump would land
+# on main and never build. workflow_dispatch and repository_dispatch are the
+# documented exceptions -- they always create a run. Hence `gh workflow run`.
+#
+# Why FAIL is red rather than a quiet PR: the sibling repos' watchers used to
+# exit 0 on BOTH "already up to date" AND "PR already open", which made a stalled
+# release indistinguishable from a healthy repo in the runs list. bitcoin-core
+# PR #1 sat open 44 days behind a daily green tick because of exactly that.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write  # required to dispatch build.yml
+  id-token: write # cosign needs an OIDC token to talk to Rekor
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # "In a public repository, scheduled workflows are automatically disabled
+      # when no repository activity has occurred in 60 days." A quiet upstream
+      # therefore kills this watcher -- and GitHub does NOT re-enable on later
+      # activity, it requires a manual click. Keep the repo warm well inside the
+      # window rather than trying to cure it afterwards.
+      - name: Keepalive (prevent 60-day cron auto-disable)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct main 2>/dev/null || git log -1 --format=%ct)
+          AGE=$(( ( $(date +%s) - LAST ) / 86400 ))
+          echo "days since last commit on main: ${AGE}"
+          if [ "$AGE" -ge 40 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive — hold scheduled workflows active (${AGE}d quiet)"
+            git push origin HEAD:main
+            echo "::notice title=Keepalive::pushed empty commit after ${AGE} quiet days"
+          fi
+
+      - name: Get latest upstream release (max semver, not publish order)
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LATEST=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/ZcashFoundation/zebra/releases?per_page=30" \
+            | jq -r '
+              [.[] | select(.prerelease == false and .draft == false) | .tag_name
+               | ltrimstr("v")
+               | select(test("^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"))]
+              | sort_by(split(".") | map(tonumber))
+              | last
+            ')
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "Could not detect upstream version (rate-limited or no stable release)"
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag=v${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream (max semver): v${LATEST}"
+
+      - name: Read current version
+        id: current
+        run: |
+          set -euo pipefail
+          CURRENT=$(tr -d '[:space:]' < VERSION)
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT"
+
+      - name: Check if update needed
+        id: check
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+          CURRENT: ${{ steps.current.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$UPSTREAM" = "$CURRENT" ]; then
+            echo "Already up to date at ${CURRENT}"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Up to date"
+              echo ""
+              echo "\`VERSION\` = upstream latest = \`${CURRENT}\`. Nothing to do."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "New version available: ${CURRENT} -> ${UPSTREAM}"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: steps.check.outputs.needed == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      # Preflight the EXACT check build.yml performs, against the NEW version.
+      # Pass here means the build will verify cleanly, so merging is mechanical.
+      - name: Preflight Sigstore trust gate
+        if: steps.check.outputs.needed == 'true'
+        id: trust
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/ZcashFoundation/zebra/releases/download/v${VERSION}"
+          VERDICT=pass; REASON="gate satisfied"
+
+          if ! curl -sSLfo SHA256SUMS "${BASE}/SHA256SUMS" \
+            || ! curl -sSLfo SHA256SUMS.sigstore.json "${BASE}/SHA256SUMS.sigstore.json"; then
+            VERDICT=fail
+            REASON="upstream v${VERSION} publishes no signed SHA256SUMS yet — release assets may still be uploading; this clears itself on a later run"
+          else
+            ISSUER=$(sed -n 's/^oidc_issuer=//p' TRUST)
+            IDENTITY=$(sed -n 's/^identity=//p' TRUST | sed "s/\${VERSION}/${VERSION}/g")
+            if cosign verify-blob SHA256SUMS \
+                 --bundle SHA256SUMS.sigstore.json \
+                 --certificate-oidc-issuer "${ISSUER}" \
+                 --certificate-identity    "${IDENTITY}" 2>/tmp/cosign.err; then
+              : # verified
+            else
+              VERDICT=fail
+              REASON="Sigstore verification FAILED for the pinned identity ${IDENTITY} — upstream's release workflow identity may have changed; review before extending TRUST"
+              sed -n '1,12p' /tmp/cosign.err || true
+            fi
+          fi
+
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON"   >> "$GITHUB_OUTPUT"
+          {
+            echo "### Sigstore preflight for ${VERSION} — **${VERDICT}**"
+            echo ""
+            echo "${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "preflight ${VERDICT}: ${REASON}"
+
+      - name: Create or update release PR
+        if: steps.check.outputs.needed == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERDICT: ${{ steps.trust.outputs.verdict }}
+          REASON: ${{ steps.trust.outputs.reason }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/${VERSION}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"; git checkout "$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+          echo "$VERSION" > VERSION
+          if ! git diff --quiet VERSION; then
+            git add VERSION
+            git commit -m "release: bump to v${VERSION}"
+          fi
+          git push origin "$BRANCH"
+
+          NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$NUM" ]; then
+            gh pr create --head "$BRANCH" --base main \
+              --title "Release ${VERSION}" \
+              --body "$(cat <<EOF
+          ## Zebra ${VERSION}
+
+          Upstream release: https://github.com/ZcashFoundation/zebra/releases/tag/${TAG}
+
+          ### Sigstore preflight — **${VERDICT}**
+
+          ${REASON}
+
+          Trust root is an **identity**, not a key — see \`TRUST\`. Zebra publishes no PGP
+          signature; \`SHA256SUMS\` is signed via Sigstore by a short-lived certificate bound
+          to upstream's exact release workflow at the exact tag.
+
+          A **pass** means that pinned identity already covers this release and the build
+          will verify cleanly — this PR is auto-merged and built.
+
+          A **fail** means the signing identity changed. Confirm upstream genuinely moved
+          its release workflow before touching \`TRUST\`; that file is the whole trust root.
+          EOF
+          )"
+            NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Auto-merge and dispatch build (preflight passed)
+        if: steps.check.outputs.needed == 'true' && steps.trust.outputs.verdict == 'pass'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUM: ${{ steps.pr.outputs.number }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$NUM" --merge --delete-branch
+          # GITHUB_TOKEN's merge push cannot trigger build.yml's `on: push`;
+          # workflow_dispatch is the documented exception and always runs.
+          gh workflow run build.yml --ref main
+          {
+            echo ""
+            echo "### Auto-merged"
+            echo ""
+            echo "PR #${NUM} merged; \`build.yml\` dispatched on \`main\` for \`${VERSION}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hold for human review (preflight failed)
+        if: steps.check.outputs.needed == 'true' && steps.trust.outputs.verdict != 'pass'
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          REASON: ${{ steps.trust.outputs.reason }}
+          NUM: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "### HELD — trust gate not satisfied"
+            echo ""
+            echo "PR #${NUM} (\`${VERSION}\`) is open and **not** merged: ${REASON}"
+            echo ""
+            echo "This run fails deliberately so the stall is visible in the runs list."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Release ${VERSION} held::${REASON} — see PR #${NUM}"
+          exit 1
