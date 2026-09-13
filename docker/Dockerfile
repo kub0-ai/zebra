@@ -29,9 +29,34 @@ RUN groupadd --gid ${GID} zebra \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-ENV ZEBRA_VERSION=${VERSION}
-ENV ZEBRA_CACHE_DIR=/var/cache/zebrad
-ENV ZEBRA_CONF=/etc/zebrad/zebrad.toml
+# 🔴 THESE MUST NOT USE THE `ZEBRA_` PREFIX. IT IS ZEBRAD'S CONFIG NAMESPACE.
+#
+# zebrad layers environment variables over the TOML file, mapping any variable
+# named ZEBRA_<X> onto the top-level config field <x>. That is a documented
+# zebrad feature -- ZEBRA_NETWORK and friends are how a user overrides config
+# without editing a file -- and it does not distinguish "a config override" from
+# "packaging metadata that happens to share the prefix". An unknown field is
+# fatal, not ignored:
+#
+#   ZEBRA_VERSION=6.3.0    -> Configuration error: unknown field `version`
+#   ZEBRA_CACHE_DIR=/...   -> Configuration error: unknown field `cache_dir`
+#   ZEBRA_FOO=bar          -> Configuration error: unknown field `foo`
+#
+# So these three variables, set purely as image metadata, made every container
+# built from this image exit 1 on startup before reading a single block. The
+# image's own labels poisoned its config parse. Verified in-cluster 2026-09-13:
+# with all three unset, the identical binary and identical config start cleanly.
+#
+# ⛔ Do not "fix" a future recurrence by unsetting ZEBRA_* in the entrypoint.
+# That would silently break the override mechanism zebrad users are entitled to.
+# Ours move out of the namespace; the namespace stays zebrad's.
+#
+# `zebrad --version` does NOT load config, which is why the build smoke test
+# passed for both published tags. The regression gate that does catch it lives
+# in .github/workflows/build.yml ("Smoke test") and runs the real entrypoint.
+ENV KUB0_ZEBRA_VERSION=${VERSION}
+ENV KUB0_ZEBRA_CACHE_DIR=/var/cache/zebrad
+ENV KUB0_ZEBRA_CONF=/etc/zebrad/zebrad.toml
 
 RUN set -ex \
   && case "${TARGETPLATFORM}" in \
@@ -45,15 +70,15 @@ RUN set -ex \
        echo "       refusing to trust the tarball on first use."; \
        exit 1; \
      fi \
-  && TARBALL="zebrad-${ZEBRA_VERSION}-${ARCH}.tar.gz" \
-  && curl -sSLfO "https://github.com/ZcashFoundation/zebra/releases/download/v${ZEBRA_VERSION}/${TARBALL}" \
+  && TARBALL="zebrad-${KUB0_ZEBRA_VERSION}-${ARCH}.tar.gz" \
+  && curl -sSLfO "https://github.com/ZcashFoundation/zebra/releases/download/v${KUB0_ZEBRA_VERSION}/${TARBALL}" \
   && echo "${EXPECTED}  ${TARBALL}" > /tmp/expected.sha256 \
   && sha256sum -c /tmp/expected.sha256 \
   && tar -xzf "${TARBALL}" zebrad \
   && install -m 0755 zebrad /usr/local/bin/zebrad \
   && rm -f "${TARBALL}" zebrad /tmp/expected.sha256 \
-  && mkdir -p "${ZEBRA_CACHE_DIR}" /etc/zebrad \
-  && chown -R ${UID}:${GID} "${ZEBRA_CACHE_DIR}" /etc/zebrad \
+  && mkdir -p "${KUB0_ZEBRA_CACHE_DIR}" /etc/zebrad \
+  && chown -R ${UID}:${GID} "${KUB0_ZEBRA_CACHE_DIR}" /etc/zebrad \
   && zebrad --version
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

@@ -99,6 +99,101 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build amd64 into the local daemon FIRST and prove the image actually
+      # starts, before anything is published. v6.3.0 was pushed, tagged and
+      # deployed while being dead on arrival: the Dockerfile set ZEBRA_VERSION /
+      # ZEBRA_CACHE_DIR / ZEBRA_CONF as image metadata, zebrad parses any
+      # ZEBRA_<X> env var as top-level config field <x>, and an unknown field is
+      # fatal -- so every container exited 1 with `unknown field version`.
+      # The only in-image check was `zebrad --version`, which does not load
+      # config and therefore passed. Publishing an unstarted image is the
+      # defect this ordering removes.
+      - name: Build amd64 for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: ./docker
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            ZEBRAD_SHA256_AMD64=${{ steps.verify.outputs.amd64 }}
+            ZEBRAD_SHA256_ARM64=${{ steps.verify.outputs.arm64 }}
+          tags: zebra:smoke
+          cache-from: type=registry,ref=ghcr.io/kub0-ai/zebra:buildcache
+
+      - name: Smoke test — the image must reach startup, and the check must be able to fail
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/zc
+          cat > /tmp/zc/zebrad.toml <<'TOML'
+          [network]
+          network = "Mainnet"
+          [state]
+          cache_dir = "/var/cache/zebrad"
+          [health]
+          listen_addr = "0.0.0.0:8080"
+          [metrics]
+          endpoint_addr = "0.0.0.0:9999"
+          TOML
+
+          # Runs the REAL entrypoint (no --entrypoint override): the config
+          # injection, the chown and the gosu drop are all part of what is under
+          # test. $1 is passed straight through so the canary can add -e.
+          run_node() {
+            local cid logs
+            cid=$(docker run -d "$@" \
+              -v /tmp/zc/zebrad.toml:/etc/zebrad/zebrad.toml:ro \
+              zebra:smoke)
+            sleep 25
+            logs=$(docker logs "$cid" 2>&1 || true)
+            docker rm -f "$cid" >/dev/null 2>&1 || true
+            printf '%s' "$logs"
+          }
+
+          # NOTE: `<<<` and not a pipe. Under `set -o pipefail` a
+          # `CMD | grep -q PAT` returns 141 (SIGPIPE) when PAT *matches*,
+          # inverting the test on exactly the input it exists to catch. A here-
+          # string is a redirect, not a pipeline, so it is immune.
+          have() { grep -qF "$1" <<< "$2"; }
+
+          echo "::group::A — the shipped image must start"
+          A=$(run_node)
+          echo "$A" | head -25
+          echo "::endgroup::"
+
+          if have 'unknown field' "$A"; then
+            echo "FAIL: zebrad rejected its configuration."
+            echo "      Almost certainly a ZEBRA_*-prefixed variable in the"
+            echo "      Dockerfile or entrypoint being parsed as a config field."
+            grep -F 'unknown field' <<< "$A" | head -3
+            exit 1
+          fi
+          if ! have 'Thank you for running' "$A"; then
+            echo "FAIL: zebrad never reached its startup banner in 25s."
+            exit 1
+          fi
+          echo "PASS: image starts and loads its config."
+
+          # A green check that CANNOT go red proves nothing. Inject a variable in
+          # zebrad's config namespace and require the assertion above to trip on
+          # it. If this canary starts cleanly, the guard has stopped working --
+          # fail the build rather than publish behind a decorative test.
+          echo "::group::B — canary: ZEBRA_SMOKECANARY must break startup"
+          B=$(run_node -e ZEBRA_SMOKECANARY=1)
+          echo "$B" | head -10
+          echo "::endgroup::"
+
+          if ! have 'unknown field' "$B"; then
+            echo "FAIL: canary did not trip. A ZEBRA_-prefixed env var no longer"
+            echo "      breaks config parsing, so check A can no longer detect"
+            echo "      the regression it exists for. Re-derive the guard before"
+            echo "      publishing."
+            exit 1
+          fi
+          echo "PASS: canary tripped — check A is live."
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
